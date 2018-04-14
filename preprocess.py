@@ -13,7 +13,7 @@ import config as cfg
 def get_dicom_fpath(patient_id, slice_id):
     return os.path.join(cfg.DICOM_DIR, patient_id, str(slice_id)+'.dcm')
 
-def get_contour_fpath(original_id, slice_id, ctr_type='i'):
+def get_contour_fpath(original_id, slice_id, ctr_type):
     ctr_fname = 'IM-0001-{:04d}-{:s}contour-manual.txt'.format(slice_id, ctr_type)
     ctr_fpath = Path(cfg.CONTOUR_DIR, original_id, ctr_type + '-contours', ctr_fname)
     return ctr_fpath
@@ -33,7 +33,7 @@ def parse_contour_file(fpath):
             coords_lst.append((x_coord, y_coord))
     return coords_lst
 
-def load_contour(original_id, slice_id, ctr_type='i'):
+def load_contour(original_id, slice_id, ctr_type):
     """Get contour coords if they exist, otherwise return None
 
     :param original_id: integer id used to find contour files
@@ -144,19 +144,59 @@ def get_patient_slice_ids(patient_id):
     slice_ids.sort()
     return slice_ids
 
+def load_slice(slice_dict):
+    """Store raw image and contour array data in slice metadata
+
+    :param slice_dict: dictionary of dicom slice metadata
+    :return: new slice_dict (metadata + raw data)
+        {
+            patient_id: patient_id str
+            ...
+            'img': slice img (numpy array),
+            'i_mask': inner contour mask (numpy array),
+            'o_mask': outer contour mask (numpy array),
+            'io_mask': outer ring around inner contour (numpy array),
+        }
+    """
+    arr = np.load(slice_dict['img_fpath'])
+    i_mask_fpath = slice_dict['i_mask_fpath']
+    o_mask_fpath = slice_dict['o_mask_fpath']
+
+    i_mask, o_mask, io_mask = (None, None, None)
+    if i_mask_fpath is not None and o_mask_fpath is not None:
+        i_mask = np.load(i_mask_fpath)
+        o_mask = np.load(o_mask_fpath)
+        io_mask = np.bitwise_xor(i_mask, o_mask)
+    elif i_mask_fpath is not None:
+        i_mask = np.load(i_mask_fpath)
+    elif o_mask_fpath is not None:
+        o_mask = np.load(o_mask_fpath)
+
+    return {
+        'patient_id': slice_dict['patient_id'],
+        'slice_id': slice_dict['slice_id'],
+        'img': arr.astype('uint8'),
+        'i_mask': i_mask.astype('uint8'),
+        'o_mask': o_mask.astype('uint8'),
+        'i_coords': slice_dict['i_coords'],
+        'o_coords': slice_dict['o_coords'],
+        'io_mask': io_mask.astype('uint8'),
+    }
+
 def process_patient_study(patient_id, original_id):
     """Create training data (array, mask) for patient's scans
 
-    NOTE: This method ignores images that do not have matching i-contour files
+    NOTE: This method ignores images that do not have both i/o contours
 
     :param patient_id: patient_id
     :param original_id: secondary id used to find contour files
     :return: List of dictionaries
         { 'patient_id': patient id
           'slice_id': slice id
-          'img_fpath': numpy img
-          'mask_fpath': numpy img
-          'dicom_fpath': path to dicom file
+          'img_fpath': fpath to slice numpy array
+          'i_mask_fpath': fpath to i-contour numpy mask
+          'o_mask_fpath': fpath to o-contour numpy mask
+          'dicom_fpath': path to dicom file,
         }
     """
     slices = []
@@ -167,32 +207,47 @@ def process_patient_study(patient_id, original_id):
         assert dcm.PatientID == patient_id
 
         img_fpath = save_dicom_arr(dcm, patient_id, slice_id)
-        coords = load_contour(original_id, slice_id, ctr_type='i')
+        i_coords = load_contour(original_id, slice_id, ctr_type='i')
+        o_coords = load_contour(original_id, slice_id, ctr_type='o')
 
-        if coords is not None:
-            mask_fpath = save_contour_mask(coords, patient_id, slice_id,
-                                           dcm.Columns, dcm.Rows, ctr_type='i')
+        i_mask_fpath, o_mask_fpath = None, None
+        if i_coords is not None:
+            i_mask_fpath = save_contour_mask(
+                i_coords, patient_id, slice_id,
+                dcm.Columns, dcm.Rows, ctr_type='i')
+        if o_coords is not None:
+            o_mask_fpath = save_contour_mask(
+                o_coords, patient_id, slice_id,
+                dcm.Columns, dcm.Rows, ctr_type='o')
+
+        # For simplicity, keep only slices with both contours
+        if i_coords is not None and o_coords is not None:
             slices.append({
                 'patient_id': patient_id,
                 'slice_id': slice_id,
-                'dicom_fpath': dcm_fpath,
                 'img_fpath': img_fpath,
-                'mask_fpath': mask_fpath,
+                'i_mask_fpath': i_mask_fpath,
+                'o_mask_fpath': o_mask_fpath,
+                'i_coords': i_coords,
+                'o_coords': o_coords,
+                'dicom_fpath': dcm_fpath,
             })
     return slices
 
-def create_dataset(patient_list_fpath):
+def create_dataset(patient_list_fpath, patient_ids=None):
     """Create training data for all patients
 
     :param patient_list_fpath: `link.csv`
+    :param patient_ids: list of patient ids
     """
     df = pd.read_csv(patient_list_fpath)
     slices = []
     for idx, row in df.iterrows():
         patient_id = row['patient_id']
         original_id = row['original_id']
-        patient_slices = process_patient_study(patient_id, original_id)
-        slices.extend(patient_slices)
+        if patient_ids is None or patient_id in patient_ids:
+            patient_slices = process_patient_study(patient_id, original_id)
+            slices.extend(patient_slices)
     return slices
 
 
